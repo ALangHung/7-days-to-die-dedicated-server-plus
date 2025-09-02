@@ -14,9 +14,35 @@ const logParser = require("./public/lib/logParser");
 const serverConfigLib = require("./public/lib/serverConfig");
 const steamcmd = require("./public/lib/steamcmd");
 const { sendTelnetCommand, telnetStart } = require("./public/lib/telnet");
-const firewall = require("./public/lib/firewall");
+const { initFirewallRule } = require("./public/lib/firewall");
 
 if (process.platform === "win32") exec("chcp 65001 >NUL");
+
+(async () => {
+  const res = await initFirewallRule();
+  let msg = "";
+  switch (res.status) {
+    case "created":
+      msg = `ℹ️ [init] 新防火牆規則已建立`;
+      eventBus.push("system", {
+        text: msg,
+      });
+      log(msg);
+      break;
+    case "exists":
+      msg = `ℹ️ [init] 防火牆規則已存在`;
+      log(msg);
+      break;
+    case "failed":
+    default:
+      msg = `ℹ️ [init] 新防火牆規則建立失敗，exit code: ${res.code}`;
+      eventBus.push("system", {
+        text: msg
+      });
+      error(msg);
+      break;
+  }
+})();
 
 const isPkg = typeof process.pkg !== "undefined";
 const baseDir = isPkg ? path.dirname(process.execPath) : process.cwd();

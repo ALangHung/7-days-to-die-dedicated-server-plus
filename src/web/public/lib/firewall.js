@@ -1,186 +1,71 @@
 const { execFile } = require("child_process");
+const path = require("path");
+const fs = require("fs");
 
 /**
- * 依名稱 + 方向(入/出/兩者) + 協定，若同方向下「沒有完全符合 opts」，
- * 就刪除該方向下同名且同協定的所有規則，接著依 opts 建立新規則。
- *
- * @param {string} displayName  GUI 看到的規則名稱
- * @param {{
- *   programPath?: string | null,                 // 綁定程式（可選）
- *   action?: 'Allow'|'Block',                    // 預設 Allow
- *   direction?: 'Inbound'|'Outbound'|'Both',     // 預設 Both
- *   protocol?: 'TCP'|'UDP',                      // 預設 TCP
- *   ports?: string,                              // "8080" | "80,443" | "5000-6000" | "8080,5000-6000"
- *   profiles?: Array<'Domain'|'Private'|'Public'>// 預設 ['Domain','Private','Public']
- * }} opts
- * @returns {Promise<any>} JSON 摘要（每個方向一筆）
+ * 執行 PowerShell 腳本，建立/檢查防火牆規則
+ * 回傳 { status: 'created' | 'exists' | 'failed', code, stdout, stderr }
  */
-function checkAndUpdateFirewallRule(displayName, opts = {}) {
-    const {
-        programPath = null,
-        action = "Allow",
-        direction = "Both",
-        protocol = "TCP",
-        ports = "",
-        profiles = ["Domain", "Private", "Public"],
-    } = opts;
-
-    // 轉義
-    const safeName = String(displayName).replace(/'/g, "''");
-    const safePorts = String(ports).replace(/'/g, "''");
-    const safeProtocol = String(protocol).toUpperCase() === "UDP" ? "UDP" : "TCP";
-    const safeAction = action === "Block" ? "Block" : "Allow";
-    const safeEnabled = '"True"'; // 以字串 True/False（非 $true/$false）
-    const dirs =
-        direction === "Outbound"
-            ? ["Outbound"]
-            : direction === "Inbound"
-                ? ["Inbound"]
-                : ["Inbound", "Outbound"];
-
-    // Profile bitmask
-    const bit = (p) => (p === "Domain" ? 1 : p === "Private" ? 2 : p === "Public" ? 4 : 0);
-    const profileMask = profiles.reduce((m, p) => m | bit(p), 0) || 0; // 0 = All
-
-    const safeProgram = programPath ? String(programPath).replace(/'/g, "''") : "";
-
-    const ps = `
-        $ErrorActionPreference = 'Stop'
-        $targetName   = '${safeName}'
-        $newPortsRaw  = '${safePorts}'
-        $protocol     = '${safeProtocol}'
-        $action       = '${safeAction}'
-        $enabledText  = ${safeEnabled}     # "True" or "False"（字串）
-        $profileMask  = ${profileMask}
-        $programPath  = '${safeProgram}'
-
-        # 將 "80,443, 5000-6000" 轉為可餵給 -LocalPort 的陣列
-        $portTokens = @()
-        foreach ($tok in ($newPortsRaw -split '\\s*,\\s*')) {
-            if ([string]::IsNullOrWhiteSpace($tok)) { continue }
-            $portTokens += $tok
-        }
-        
-        function PortsEqual($existing, $desired) {
-            if ($null -eq $existing) { $existing = @() }
-            elseif ($existing -is [string]) { $existing = @($existing) }
-
-            if ($null -eq $desired) { $desired = @() }
-            elseif ($desired -is [string]) { $desired = @($desired) }
-
-            $exNorm = @()
-            foreach ($i in $existing) { $exNorm += (($i -split ',') | % { $_.Trim() } | ? { $_ }) }
-
-            $deNorm = @()
-            foreach ($i in $desired)  { $deNorm += (($i -split ',') | % { $_.Trim() } | ? { $_ }) }
-
-            $exNorm = @($exNorm | Sort-Object -Unique)
-            $deNorm = @($deNorm | Sort-Object -Unique)
-
-            if ($exNorm.Count -ne $deNorm.Count) { return $false }
-            for ($i = 0; $i -lt $exNorm.Count; $i++) {
-                if ($exNorm[$i] -ne $deNorm[$i]) { return $false }
-            }
-            return $true
-        }
-
-        function ProcessDirection($dir) {
-            # 取得此方向、同名、同協定的所有規則
-            $all = Get-NetFirewallRule -DisplayName $targetName -ErrorAction SilentlyContinue | Where-Object { $_.Direction -eq $dir }
-            $sameProto = @()
-            foreach ($r in $all) {
-                $pf = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $r
-                if ($pf.Protocol -eq $protocol) { $sameProto += $r }
-            }
-
-            # 檢查是否已有完全符合的規則
-            $hasExact = $false
-            foreach ($r in $sameProto) {
-                $pf  = Get-NetFirewallPortFilter       -AssociatedNetFirewallRule $r
-                $app = Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $r
-
-                $portsOK   = PortsEqual -existing $pf.LocalPort -desired $portTokens
-                $programOK = $true
-                if ($programPath) {
-                    $programOK = ($app.Program -eq $programPath)
-                }
-                $actionOK  = ($r.Action -eq $action)
-                $profileOK = ($profileMask -eq 0) -or ($r.Profile -eq $profileMask)
-
-                if ($portsOK -and $programOK -and $actionOK -and $profileOK) {
-                    $hasExact = $true
-                }
-            }
-
-            if ($hasExact) {
-                return [PSCustomObject]@{
-                    DisplayName = $targetName
-                    Direction   = $dir
-                    Protocol    = $protocol
-                    LocalPorts  = $portTokens
-                    Action      = $action
-                    Enabled     = $enabledText
-                    ProfileMask = $profileMask
-                    Program     = $programPath
-                    Recreated   = $false
-                    SkippedBecauseAlreadyMatches = $true
-                }
-            }
-
-            # 沒有完全符合 → 刪掉此方向、同名、同協定的規則
-            if ($sameProto.Count -gt 0) { $sameProto | ForEach-Object { Remove-NetFirewallRule -Name $_.Name } }
-
-            # 依 opts 建立新規則
-            $params = @{
-                DisplayName = $targetName
-                Direction   = $dir
-                Action      = $action
-                Protocol    = $protocol
-                LocalPort   = $portTokens
-                Enabled     = $enabledText
-            }
-            if ($profileMask -ne 0) { $params.Profile = $profileMask }
-            if ($programPath)       { $params.Program = $programPath }
-
-            New-NetFirewallRule @params | Out-Null
-
-            return [PSCustomObject]@{
-                DisplayName = $targetName
-                Direction   = $dir
-                Protocol    = $protocol
-                LocalPorts  = $portTokens
-                Action      = $action
-                Enabled     = $enabledText
-                ProfileMask = $profileMask
-                Program     = $programPath
-                Recreated   = $true
-                SkippedBecauseAlreadyMatches = $false
-            }
-        }
-
-       $result = @()
-       ${dirs.map((d) => `\$result += ProcessDirection('${d}')`).join("\n")}
-       $result | ConvertTo-Json -Depth 4
-       `.trim();
-
-    return new Promise((resolve, reject) => {
-        execFile(
-            "powershell",
-            ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
-            { windowsHide: true, maxBuffer: 1024 * 1024 },
-            (err, stdout, stderr) => {
-                if (err) return reject(err);
-                try {
-                    resolve(JSON.parse(stdout || "[]"));
-                } catch (e) {
-                    reject(
-                        new Error(`PowerShell 輸出解析失敗：${e}\nstdout=${stdout}\nstderr=${stderr}`)
-                    );
-                }
-            }
-        );
+function initFirewallRule() {
+  // 1) 指向 ps1（用絕對路徑最穩）
+  const psScriptPath = path.join(__dirname, "checkOrCreateGameServerFirewallRule.ps1");
+  if (!fs.existsSync(psScriptPath)) {
+    return Promise.resolve({
+      status: "failed",
+      code: -1,
+      stdout: "",
+      stderr: `PowerShell script not found: ${psScriptPath}`,
     });
+  }
+
+  // 2) 指向 .exe（示例：同層往上兩層的 7DaysToDieServer.exe；自行調整）
+  const programPath = path.join(__dirname, "..", "..", "7daystodieserver", "7DaysToDieServer.exe");
+
+  const args = [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy", "Bypass",
+    "-File", psScriptPath,
+    "-ProgramPath", programPath,
+    "-DisplayName", "7 Days To Die Server",
+    "-Description", "Allow inbound TCP/UDP all ports for MyGame server",
+  ];
+
+  const options = {
+    cwd: path.dirname(psScriptPath), // 讓 ps1 內相對路徑以腳本所在目錄為基準
+    windowsHide: true,
+  };
+
+  return new Promise((resolve) => {
+    execFile("powershell.exe", args, options, (error, stdoutRaw, stderrRaw) => {
+      const code = error ? (error.code ?? -1) : 0;
+      const stdout = (stdoutRaw || "").toString();
+      const stderr = (stderrRaw || "").toString();
+
+      // 依照 ps1 的輸出判斷狀態
+      // ps1 會輸出：
+      // - "Created: TCP ..." / "Created: UDP ..." → 代表有建立
+      // - "Already present: TCP/UDP ..." → 代表已存在
+      const createdRe = /Created:\s*(TCP|UDP)\s+/i;
+      const alreadyRe = /Already present:/i;
+
+      let status;
+      if (code === 0) {
+        if (createdRe.test(stdout)) {
+          status = "created";
+        } else if (alreadyRe.test(stdout)) {
+          status = "exists";
+        } else {
+          // 成功退出但沒偵測到關鍵字，視為已存在（保守處理）
+          status = "exists";
+        }
+      } else {
+        status = "failed";
+      }
+
+      resolve({ status, code, stdout, stderr });
+    });
+  });
 }
 
-
-module.exports = { checkAndUpdateFirewallRule };
+module.exports = { initFirewallRule };
