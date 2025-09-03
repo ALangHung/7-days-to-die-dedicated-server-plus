@@ -30,7 +30,10 @@ if (process.platform === "win32") exec("chcp 65001 >NUL");
       log(msg);
       break;
     case "exists":
-      msg = `ℹ️ [init] 防火牆規則已存在`;
+      msg = `ℹ️ [init] 防火牆規則檢查沒有問題`;
+      eventBus.push("system", {
+        text: msg,
+      });
       log(msg);
       break;
     case "failed":
