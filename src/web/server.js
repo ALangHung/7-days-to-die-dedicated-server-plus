@@ -1058,24 +1058,6 @@ app.get("/api/check-port-forward", async (req, res) => {
 
     const dummyState = await ensureDummyGamePort(port);
 
-    try {
-      let resulf = await firewall.checkAndUpdateFirewallRule("7 Days To Die Dedicated Server Plus_CheckGameServerPort", {
-        programPath: path.join(GAME_DIR, "7DaysToDieServer.exe"),
-        direction: "Inbound",
-        protocol: "TCP",
-        ports: port,
-      });
-      if (resulf.Recreated) {
-        let msg = `✅ 已調整防火牆規則: ${resulf.DisplayName} (${resulf.Protocol} ${port})`;
-        eventBus.push("system", { text: msg });
-        log(msg);
-      }
-    } catch (e) {
-      const msg = `❌ 確認防火牆規則時失敗\n ${e}`;
-      error(msg);
-      return http.sendErr(req, res, msg);
-    }
-
     let open = false;
     let raw = null;
 
